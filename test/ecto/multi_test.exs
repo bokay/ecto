@@ -330,4 +330,57 @@ defmodule Ecto.MultiTest do
       Multi.new |> Multi.run(:run, fun) |> Multi.run(:run, fun)
     end
   end
+
+  test "merge successfully flattens results" do
+    changeset = Changeset.change(%Comment{})
+    multi =
+      Multi.new
+      |> Multi.insert(:insert, changeset)
+      |> Multi.merge(fn data, multi ->
+        multi |> Multi.update(:update, Changeset.change(data.insert, x: 1))
+      end)
+
+    assert {:ok, data} = TestRepo.transaction(multi)
+    assert %Comment{} = data.insert
+    assert %Comment{} = data.update
+  end
+
+  test "merge rollbacks on errors" do
+    error = fn _ -> {:error, :error} end
+    ok    = fn _ -> {:ok, :ok} end
+
+    multi =
+      Multi.new
+      |> Multi.run(:outside_ok, ok)
+      |> Multi.merge(fn _, multi ->
+        multi
+        |> Multi.run(:inside_ok, ok)
+        |> Multi.run(:inside_error, error)
+      end)
+
+    assert {:error, :inside_error, :error, data} = TestRepo.transaction(multi)
+    assert :ok == data.outside_ok
+    assert :ok == data.inside_ok
+  end
+
+  test "merge does not allow repeated operations" do
+    fun = fn _ -> {:ok, :ok} end
+
+    Multi.new
+    |> Multi.merge(fn _, multi ->
+      assert_raise RuntimeError, ~r":run is already a member", fn ->
+        Multi.run(multi, :run, fun)
+      end
+    end)
+    |> Multi.run(:run, fun)
+
+
+    Multi.new
+    |> Multi.merge(fn _, multi -> Multi.run(multi, :run, fun) end)
+    |> Multi.merge(fn _, multi ->
+      assert_raise RuntimeError, ~r":run is already a member", fn ->
+        Multi.run(multi, :run, fun)
+      end
+    end)
+  end
 end
