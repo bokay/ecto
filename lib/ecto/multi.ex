@@ -99,10 +99,11 @@ defmodule Ecto.Multi do
   defstruct operations: [], names: MapSet.new
 
   @type run :: (t -> {:ok | :error, any}) | {module, atom, [any]}
+  @type merge :: (map -> t) | {module, atom, [any]}
   @typep schema_or_source :: binary | {binary | nil, binary} | Ecto.Schema.t
   @typep operation :: {:changeset, Changeset.t, Keyword.t} |
                       {:run, run} |
-                      {:merge, t} |
+                      {:merge, merge} |
                       {:update_all, Ecto.Query.t, Keyword.t} |
                       {:delete_all, Ecto.Query.t, Keyword.t} |
                       {:insert_all, schema_or_source, [map | Keyword.t], Keyword.t}
@@ -162,28 +163,49 @@ defmodule Ecto.Multi do
   defp do_merge(%Multi{} = lhs, %Multi{} = rhs, joiner) do
     %{names: lhs_names, operations: lhs_ops} = lhs
     %{names: rhs_names, operations: rhs_ops} = rhs
-    if MapSet.disjoint?(lhs_names, rhs_names) do
-      %Multi{names: MapSet.union(lhs_names, rhs_names),
-             operations: joiner.(lhs_ops, rhs_ops)}
-    else
-      common = MapSet.intersection(lhs_names, rhs_names) |> MapSet.to_list
-      raise ArgumentError, """
-      error when merging the following Ecto.Multi structs:
+    case MapSet.intersection(lhs_names, rhs_names) |> MapSet.to_list do
+      [] ->
+        %Multi{names: MapSet.union(lhs_names, rhs_names),
+               operations: joiner.(lhs_ops, rhs_ops)}
+      common ->
+        raise ArgumentError, """
+        error when merging the following Ecto.Multi structs:
 
-      #{inspect lhs}
+        #{inspect lhs}
 
-      #{inspect rhs}
+        #{inspect rhs}
 
-      both declared operations: #{inspect common}
-      """
+        both declared operations: #{inspect common}
+        """
     end
   end
 
   @doc """
+  Merges a dynamically created multi
+
+  The function should return an Ecto.Multi, and receives changes so far
+  as an argument.
+
+  Duplicated operations are not allowed.
   """
-  @spec merge(t, (map, t -> t)) :: t
-  def merge(%Multi{} = multi, fun) when is_function(fun, 2) do
-    Map.update!(multi, :operations, &[{:merge, {:merge, fun}} | &1])
+  @spec merge(t, merge) :: t
+  def merge(%Multi{} = multi, merge) when is_function(merge, 1) do
+    Map.update!(multi, :operations, &[{:merge, {:merge, merge}} | &1])
+  end
+
+  @doc """
+  Merges a dynamically created multi
+
+  Similar to `merge/2`, but allows to pass module name, function and arguments.
+  The function should return an Ecto.Multi, and receives changes so far
+  as the first argument (prepened to those passed in the call to the function).
+
+  Duplicated operations are not allowed.
+  """
+  @spec merge(t, module, function, args) :: t
+    when function: atom, args: [any]
+  def merge(multi, mod, fun, args) do
+    Map.update!(multi, :operations, &[{:merge, {:merge, {mod, fun, args}}} | &1])
   end
 
   @doc """
@@ -208,7 +230,7 @@ defmodule Ecto.Multi do
   Accepts the same arguments and options as `Ecto.Repo.update/3` does.
   """
   @spec update(t, name, Changeset.t, Keyword.t) :: t
-  def update(multi, name, %Changeset{} = changeset, opts) do
+  def update(multi, name, %Changeset{} = changeset, opts \\ []) do
     add_changeset(multi, :update, name, changeset, opts)
   end
 
@@ -359,11 +381,12 @@ defmodule Ecto.Multi do
   end
 
   defp apply_operation({name, operation}, repo, wrap, return, {acc, names}) do
-    case apply_operation(operation, acc, {names, wrap, return}, repo) do
+    case apply_operation(operation, acc, {wrap, return}, repo) do
       {:merge, {:ok, value}} ->
-        {Map.merge(acc, value), Enum.into(Map.keys(value), names)}
+        merge_results(acc, value, names)
       {:merge, {:error, {name, value, nested_acc}}} ->
-        return.({name, value, Map.merge(acc, nested_acc)})
+        {acc, _names} = merge_results(acc, nested_acc, names)
+        return.({name, value, acc})
       {:ok, value} ->
         {Map.put(acc, name, value), names}
       {:error, value} ->
@@ -373,16 +396,28 @@ defmodule Ecto.Multi do
 
   defp apply_operation({:changeset, changeset, opts}, _acc, _apply_args, repo),
     do: apply(repo, changeset.action, [changeset, opts])
-  defp apply_operation({:run, {mod, fun, args}}, acc, _apply_args, _repo),
-    do: apply(mod, fun, [acc | args])
   defp apply_operation({:run, run}, acc, _apply_args, _repo),
-    do: apply(run, [acc])
+    do: apply_fun(run, acc)
   defp apply_operation({:insert_all, source, entries, opts}, _acc, _apply_args, repo),
     do: {:ok, repo.insert_all(source, entries, opts)}
   defp apply_operation({:update_all, query, updates, opts}, _acc, _apply_args, repo),
     do: {:ok, repo.update_all(query, updates, opts)}
   defp apply_operation({:delete_all, query, opts}, _acc, _apply_args, repo),
     do: {:ok, repo.delete_all(query, opts)}
-  defp apply_operation({:merge, fun}, acc, {names, wrap, return}, repo),
-    do: {:merge, __apply__(fun.(acc, %Multi{names: names}), repo, wrap, return)}
+  defp apply_operation({:merge, merge}, acc, {wrap, return}, repo),
+    do: {:merge, __apply__(apply_fun(merge, acc), repo, wrap, return)}
+
+  defp apply_fun({mod, fun, args}, acc), do: apply(mod, fun, [acc | args])
+  defp apply_fun(fun, acc),              do: apply(fun, [acc])
+
+  defp merge_results(changes, new_changes, names) do
+    new_names = new_changes |> Map.keys |> MapSet.new
+    case MapSet.intersection(names, new_names) |> MapSet.to_list do
+      [] ->
+        {Map.merge(changes, new_changes), MapSet.union(names, new_names)}
+      common ->
+        raise "merging results of multi, found operations: #{inspect common} " <>
+          "already present in the enclosing multi"
+    end
+  end
 end

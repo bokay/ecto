@@ -16,6 +16,7 @@ defmodule Ecto.MultiTest do
   end
 
   def ok(x), do: {:ok, x}
+  def multi(x), do: Multi.new |> Multi.update(:update, Changeset.change(x.insert))
 
   test "new" do
     assert Multi.new == %Multi{}
@@ -271,18 +272,30 @@ defmodule Ecto.MultiTest do
     end
   end
 
-  test "merge successfully flattens results" do
+  test "merge with fun" do
     changeset = Changeset.change(%Comment{})
     multi =
       Multi.new
       |> Multi.insert(:insert, changeset)
-      |> Multi.merge(fn data, multi ->
-        multi |> Multi.update(:update, Changeset.change(data.insert, x: 1))
+      |> Multi.merge(fn data ->
+        Multi.new |> Multi.update(:update, Changeset.change(data.insert))
       end)
 
     assert {:ok, data} = TestRepo.transaction(multi)
     assert %Comment{} = data.insert
     assert %Comment{} = data.update
+  end
+
+  test "merge with mfa" do
+    changeset = Changeset.change(%Comment{})
+    multi =
+      Multi.new
+      |> Multi.insert(:insert, changeset)
+      |> Multi.merge(__MODULE__, :multi, [])
+
+      assert {:ok, data} = TestRepo.transaction(multi)
+      assert %Comment{} = data.insert
+      assert %Comment{} = data.update
   end
 
   test "merge rollbacks on errors" do
@@ -292,8 +305,8 @@ defmodule Ecto.MultiTest do
     multi =
       Multi.new
       |> Multi.run(:outside_ok, ok)
-      |> Multi.merge(fn _, multi ->
-        multi
+      |> Multi.merge(fn _ ->
+        Multi.new
         |> Multi.run(:inside_ok, ok)
         |> Multi.run(:inside_error, error)
       end)
@@ -306,21 +319,24 @@ defmodule Ecto.MultiTest do
   test "merge does not allow repeated operations" do
     fun = fn _ -> {:ok, :ok} end
 
-    Multi.new
-    |> Multi.merge(fn _, multi ->
-      assert_raise RuntimeError, ~r":run is already a member", fn ->
-        Multi.run(multi, :run, fun)
-      end
-    end)
-    |> Multi.run(:run, fun)
+    multi =
+      Multi.new
+      |> Multi.merge(fn _ ->
+        Multi.new |> Multi.run(:run, fun)
+      end)
+      |> Multi.run(:run, fun)
 
+    assert_raise RuntimeError, ~r"found operations: \[:run\] already present", fn ->
+      TestRepo.transaction(multi)
+    end
 
-    Multi.new
-    |> Multi.merge(fn _, multi -> Multi.run(multi, :run, fun) end)
-    |> Multi.merge(fn _, multi ->
-      assert_raise RuntimeError, ~r":run is already a member", fn ->
-        Multi.run(multi, :run, fun)
-      end
-    end)
+    multi =
+      Multi.new
+      |> Multi.merge(fn _ -> Multi.new |> Multi.run(:run, fun) end)
+      |> Multi.merge(fn _ -> Multi.new |> Multi.run(:run, fun) end)
+
+    assert_raise RuntimeError, ~r"found operations: \[:run\] already present", fn ->
+      TestRepo.transaction(multi)
+    end
   end
 end
